@@ -178,16 +178,16 @@ class fvvdp:
         Q_JOD - a scalar with the JOD score
         stats - a dictionary with additional data, for example stats["heatmap"] contains a PyTorch tensor with a heatmap
     '''
-    def predict(self, test_cont, reference_cont, dim_order="BCFHW", frames_per_second=0, fixation_point=None):
+    def predict(self, test_cont, reference_cont, dim_order="BCFHW", frames_per_second=0, fixation_point=None, attention_mask=None):
 
         test_vs = fvvdp_video_source_array( test_cont, reference_cont, frames_per_second, dim_order=dim_order, display_photometry=self.display_photometry, color_space_name=self.color_space )
 
-        return self.predict_video_source(test_vs, fixation_point=fixation_point)
+        return self.predict_video_source(test_vs, fixation_point=fixation_point, attention_mask=attention_mask)
 
     '''
     The same as `predict` but takes as input fvvdp_video_source_* object instead of Numpy/Pytorch arrays.
     '''
-    def predict_video_source(self, vid_source, fixation_point=None):
+    def predict_video_source(self, vid_source, fixation_point=None, attention_mask=None):
 
         # T_vid and R_vid are the tensors of the size (1,1,N,H,W)
         # where:
@@ -303,7 +303,7 @@ class fvvdp:
                 # Used for training
                 Q_per_ch_block = checkpoint.checkpoint(self.process_block_of_frames, ff, R, vid_sz, temp_ch, fixation_point, heatmap, use_reentrant=False)
             else:
-                Q_per_ch_block = self.process_block_of_frames(ff, R, vid_sz, temp_ch, fixation_point, heatmap)
+                Q_per_ch_block = self.process_block_of_frames(ff, R, vid_sz, temp_ch, fixation_point, heatmap, attention_mask)
 
             if Q_per_ch is None:
                 Q_per_ch = torch.zeros((Q_per_ch_block.shape[0], Q_per_ch_block.shape[1], N_frames), device=self.device)
@@ -356,7 +356,7 @@ class fvvdp:
         Q_jod = sign(self.jod_a) * ((abs(self.jod_a)**(1.0/beta_jod))* Q)**beta_jod + 10.0 # This one can help with very large numbers
         return Q_jod.squeeze()
 
-    def process_block_of_frames(self, ff, R, vid_sz, temp_ch, fixation_point, heatmap):
+    def process_block_of_frames(self, ff, R, vid_sz, temp_ch, fixation_point, heatmap, attention_mask=None):
         # TODO: process multiple frames at a time. Right now, we process one frame at a time
 
         height, width, N_frames = vid_sz
@@ -365,6 +365,13 @@ class fvvdp:
 
         # Perform Laplacian pyramid decomposition
         B_bands, B_gbands = self.lpyr.decompose(R[0,...])
+
+        if attention_mask is not None:
+            from skimage.measure import block_reduce
+            attention_mask_bands = [attention_mask]
+            for bb in range(self.lpyr.get_band_count() - 1):
+                attention_mask_band = block_reduce(attention_mask_bands[-1], block_size=(1, 2, 2), func=np.max)
+                attention_mask_bands.append(attention_mask_band)
 
         if self.debug: assert len(B_bands) == self.lpyr.get_band_count()
 
@@ -464,7 +471,12 @@ class fvvdp:
                 if Q_per_ch_block is None:
                     Q_per_ch_block = torch.zeros((self.lpyr.height, 2, 1), device=self.device)
 
-                Q_per_ch_block[bb,cc,0] = self.lp_norm(D.flatten(), self.beta, 0, True)
+                if attention_mask is not None:
+                    D_sel = D[attention_mask_bands[bb][ff]]
+                else:
+                    D_sel = D.flatten()
+
+                Q_per_ch_block[bb,cc,0] = self.lp_norm(D_sel, self.beta, 0, True)
 
         if self.do_heatmap:
             beta_jod = np.power(10.0, self.log_jod_exp)
